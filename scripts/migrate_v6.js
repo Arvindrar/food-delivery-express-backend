@@ -1,28 +1,23 @@
 const db = require('../config/db');
 
-const migrate = async () => {
+async function migrate() {
   try {
-    console.log('🚀 Adding latitude and longitude columns to orders and addresses...');
-    
-    // DECIMAL(10,8) for latitude: ranges from -90.00000000 to 90.00000000
-    // DECIMAL(11,8) for longitude: ranges from -180.00000000 to 180.00000000
+    console.log('Starting migration: Adding fee and commission columns to orders...');
     
     await db.pool.query(`
-      ALTER TABLE addresses ADD COLUMN IF NOT EXISTS latitude DECIMAL(10,8);
-      ALTER TABLE addresses ADD COLUMN IF NOT EXISTS longitude DECIMAL(11,8);
+      ALTER TABLE orders 
+      ADD COLUMN IF NOT EXISTS distance DECIMAL(10,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS delivery_fee INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS handling_fee INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS platform_commission INTEGER DEFAULT 0;
     `);
 
-    await db.pool.query(`
-      ALTER TABLE orders ADD COLUMN IF NOT EXISTS latitude DECIMAL(10,8);
-      ALTER TABLE orders ADD COLUMN IF NOT EXISTS longitude DECIMAL(11,8);
-    `);
-
-    console.log('🎉 Migration successful!');
+    console.log('Migration successful!');
     process.exit(0);
   } catch (err) {
-    console.error('❌ Migration failed:', err);
+    console.error('Migration failed:', err);
     process.exit(1);
   }
-};
+}
 
 migrate();

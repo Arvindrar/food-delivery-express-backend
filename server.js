@@ -6,6 +6,7 @@ const dotenv = require('dotenv');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const Razorpay = require('razorpay');
 
 // Simple JSON Logger
 const logger = (req, res, next) => {
@@ -32,6 +33,11 @@ app.use('/api/uploads', express.static(path.join(__dirname, 'public/uploads')));
 
 // Load environment variables
 dotenv.config();
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET
+});
 
 const db = require('./config/db');
 
@@ -115,12 +121,21 @@ db.pool.query('SELECT NOW()', (err, res) => {
 app.get('/api/search/category/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await db.pool.query(`
+    const { is_veg } = req.query;
+    let queryText = `
       SELECT m.*, r.name as restaurant_name, r.address as restaurant_address, r.image_url as restaurant_image
       FROM menu_items m
       JOIN restaurants r ON m.restaurant_id = r.id
       WHERE m.category_id = $1 AND m.is_available = true
-    `, [id]);
+    `;
+    
+    if (is_veg === 'true') {
+      queryText += ' AND m.is_veg = true ORDER BY m.id ASC';
+    } else {
+      queryText += ' ORDER BY m.id ASC';
+    }
+
+    const result = await db.pool.query(queryText, [id]);
     const rows = result.rows.map(r => ({
       ...r,
       image_url: r.image_url ? getUploadUrl(req, r.image_url) : null,
@@ -139,18 +154,27 @@ app.get('/api/admin/stats', async (req, res) => {
     const stats = await db.pool.query(`
       SELECT 
         CAST((SELECT COUNT(*) FROM orders) AS INTEGER) as total_orders,
-        CAST((SELECT COALESCE(SUM(total_amount), 0) FROM orders) AS INTEGER) as total_revenue,
+        CAST((SELECT COALESCE(SUM(total_amount), 0) FROM orders WHERE status = 'Completed') AS INTEGER) as total_revenue,
         CAST((SELECT COUNT(*) FROM restaurants) AS INTEGER) as total_restaurants,
         CAST((SELECT COUNT(*) FROM users) AS INTEGER) as total_users,
         CAST((SELECT COUNT(*) FROM categories) AS INTEGER) as total_categories,
-        CAST((SELECT COUNT(*) FROM users WHERE is_driver = TRUE) AS INTEGER) as total_drivers
+        CAST((SELECT COUNT(*) FROM drivers) AS INTEGER) as total_drivers,
+        CAST((SELECT COALESCE(SUM(platform_commission), 0) FROM orders WHERE status = 'Completed') AS INTEGER) as total_commissions
     `);
     
     const recentOrders = await db.pool.query(`
-      SELECT o.*, r.name as restaurant_name, u.name as user_name, r.latitude as restaurant_lat, r.longitude as restaurant_lng, r.image_url as r_image_url
+      SELECT 
+        o.*, 
+        r.name as restaurant_name, 
+        u.name as user_name, 
+        r.latitude as restaurant_lat, 
+        r.longitude as restaurant_lng, 
+        r.image_url as r_image_url,
+        d.name as driver_name
       FROM orders o
       LEFT JOIN restaurants r ON o.restaurant_id = r.id
       LEFT JOIN users u ON o.user_id = u.id
+      LEFT JOIN drivers d ON o.driver_id = d.id
       ORDER BY o.created_at DESC
       LIMIT 10
     `);
@@ -173,7 +197,7 @@ app.get('/api/admin/stats', async (req, res) => {
 app.get('/api/admin/users', async (req, res) => {
   try {
     const users = await db.pool.query(`
-      SELECT u.id, u.name, u.phone, u.is_admin, u.is_driver, u.created_at,
+      SELECT u.id, u.name, u.phone, u.created_at,
              (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) as total_orders
       FROM users u
       ORDER BY u.created_at DESC
@@ -192,7 +216,8 @@ app.get('/api/admin/restaurants', async (req, res) => {
              (SELECT COUNT(*) FROM menu_items m WHERE m.restaurant_id = r.id) as item_count,
              (SELECT COUNT(*) FROM orders o WHERE o.restaurant_id = r.id) as order_count
       FROM restaurants r
-      ORDER BY r.name ASC
+      WHERE r.is_deleted = false
+      ORDER BY r.display_order ASC, r.id ASC
     `);
     
     // Map absolute URLs
@@ -207,6 +232,45 @@ app.get('/api/admin/restaurants', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch restaurants' });
   }
 });
+
+app.put('/api/admin/restaurants/reorder', async (req, res) => {
+  try {
+    const { items } = req.body; // Array of {id, display_order}
+    if (!Array.isArray(items)) return res.status(400).json({ error: 'Invalid items array' });
+    
+    console.log('[ADMIN] Reordering restaurants:', items.length, 'items');
+    
+    const promises = items.map(item => 
+      db.pool.query('UPDATE restaurants SET display_order = $1 WHERE id = $2', [item.display_order, item.id])
+    );
+    
+    await Promise.all(promises);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[ADMIN ERROR] Reorder failed:', err);
+    res.status(500).json({ error: 'Failed to reorder restaurants' });
+  }
+});
+
+app.get('/api/admin/commissions', async (req, res) => {
+  try {
+    const result = await db.pool.query(`
+      SELECT o.id, o.created_at, o.total_amount, o.delivery_fee, o.handling_fee, o.platform_commission, o.driver_earnings,
+             r.name as restaurant_name, u.name as user_name, d.name as driver_name
+      FROM orders o
+      JOIN restaurants r ON o.restaurant_id = r.id
+      JOIN users u ON o.user_id = u.id
+      LEFT JOIN drivers d ON o.driver_id = d.id
+      WHERE o.status = 'Completed'
+      ORDER BY o.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch commissions' });
+  }
+});
+
 
 app.put('/api/admin/restaurants/:id/status', async (req, res) => {
   try {
@@ -223,20 +287,23 @@ app.put('/api/admin/restaurants/:id/status', async (req, res) => {
 // Admin: Enhanced Restaurant Management
 app.post('/api/admin/restaurants', async (req, res) => {
   try {
-    const { name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id } = req.body;
+    const { name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id, login_id } = req.body;
     
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const result = await db.pool.query(
-      `INSERT INTO restaurants (name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id, is_active) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE) RETURNING id`,
-      [name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, hashedPassword, category_id]
+      `INSERT INTO restaurants (name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, password_plain, category_id, is_active, login_id) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11) RETURNING id`,
+      [name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, hashedPassword, password, category_id, login_id || null]
     );
     
     res.json({ success: true, id: result.rows[0].id });
   } catch (err) {
     console.error(err);
+    if (err.code === '23505' && err.constraint && err.constraint.includes('login_id')) {
+      return res.status(400).json({ error: 'Login ID already exists. Please choose a unique one.' });
+    }
     res.status(500).json({ error: 'Failed to create restaurant' });
   }
 });
@@ -244,36 +311,89 @@ app.post('/api/admin/restaurants', async (req, res) => {
 app.put('/api/admin/restaurants/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id } = req.body;
+    const { name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id, login_id } = req.body;
     
-    let query = 'UPDATE restaurants SET name=$1, address=$2, cuisines=$3, delivery_time=$4, cost_for_two=$5, is_veg_only=$6, image_url=$7, category_id=$8';
-    let params = [name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, category_id];
+    let query = 'UPDATE restaurants SET name=$1, address=$2, cuisines=$3, delivery_time=$4, cost_for_two=$5, is_veg_only=$6, image_url=$7, category_id=$8, login_id=$9';
+    let params = [name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, category_id, login_id || null];
     
     if (password) {
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
-      query += ', password=$9 WHERE id=$10';
-      params.push(hashedPassword, id);
+      query += ', password=$10, password_plain=$11 WHERE id=$12';
+      params.push(hashedPassword, password, id);
     } else {
-      query += ' WHERE id=$9';
+      query += ' WHERE id=$10';
       params.push(id);
     }
     
-    console.log('[ADMIN] Updating restaurant:', { id, name, category_id, hasPassword: !!password });
+    console.log('[ADMIN] Updating restaurant:', { id, name, category_id, login_id, hasPassword: !!password });
     await db.pool.query(query, params);
     res.json({ success: true });
   } catch (err) {
     console.error('[ADMIN ERROR] Restaurant update failed:', err);
+    if (err.code === '23505' && err.detail && err.detail.includes('login_id')) {
+      return res.status(400).json({ error: 'Login ID already in use by another restaurant.' });
+    }
     res.status(500).json({ error: 'Failed to update restaurant' });
+  }
+});
+
+// Admin: Reorder Restaurants
+app.put('/api/admin/restaurants/reorder', async (req, res) => {
+  try {
+    const { items } = req.body; // Expects [{ id: 1, display_order: 1 }, ...]
+    await db.pool.query('BEGIN');
+    
+    for (const item of items) {
+      await db.pool.query(
+        'UPDATE restaurants SET display_order = $1 WHERE id = $2',
+        [item.display_order, item.id]
+      );
+    }
+    
+    await db.pool.query('COMMIT');
+    res.json({ success: true });
+  } catch (err) {
+    await db.pool.query('ROLLBACK');
+    console.error('Reorder failed:', err);
+    res.status(500).json({ error: 'Failed to reorder restaurants' });
+  }
+});
+
+// Admin: Soft Delete Restaurant
+app.put('/api/admin/restaurants/:id/soft-delete', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.pool.query('UPDATE restaurants SET is_deleted = true, is_active = false WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to archive restaurant' });
+  }
+});
+
+// Admin: Hard Delete Restaurant
+app.delete('/api/admin/restaurants/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.pool.query('DELETE FROM restaurants WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    // 23503 is foreign_key_violation
+    if (err.code === '23503') {
+      return res.status(400).json({ error: 'Cannot hard delete: Restaurant has attached orders or dependencies. Use archive instead.' });
+    }
+    res.status(500).json({ error: 'Failed to delete restaurant' });
   }
 });
 
 // Admin: Categories Management
 app.post('/api/admin/categories', async (req, res) => {
   try {
-    const { name, image_url } = req.body;
-    console.log('[ADMIN] Creating category:', { name, image_url });
-    const result = await db.pool.query('INSERT INTO categories (name, image_url) VALUES ($1, $2) RETURNING id', [name, image_url]);
+    const { name, image_url, veg_type } = req.body;
+    console.log('[ADMIN] Creating category:', { name, image_url, veg_type });
+    const result = await db.pool.query('INSERT INTO categories (name, image_url, veg_type) VALUES ($1, $2, $3) RETURNING id', [name, image_url, veg_type || 'both']);
     res.json({ success: true, id: result.rows[0].id });
   } catch (err) {
     console.error('[ADMIN ERROR] Category creation failed:', err);
@@ -298,9 +418,9 @@ app.delete('/api/admin/categories/:id', async (req, res) => {
 app.put('/api/admin/categories/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, image_url } = req.body;
-    console.log('[ADMIN] Updating category:', { id, name, image_url });
-    await db.pool.query('UPDATE categories SET name = $1, image_url = $2 WHERE id = $3', [name, image_url, id]);
+    const { name, image_url, veg_type } = req.body;
+    console.log('[ADMIN] Updating category:', { id, name, image_url, veg_type });
+    await db.pool.query('UPDATE categories SET name = $1, image_url = $2, veg_type = $3 WHERE id = $4', [name, image_url, veg_type || 'both', id]);
     res.json({ success: true });
   } catch (err) {
     console.error('[ADMIN ERROR] Category update failed:', err);
@@ -312,7 +432,7 @@ app.put('/api/admin/categories/:id', async (req, res) => {
 // Admin: Driver Management
 app.get('/api/admin/drivers', async (req, res) => {
   try {
-    const result = await db.pool.query("SELECT id, name, phone, created_at, is_online, latitude, longitude, password_plain FROM users WHERE is_driver = TRUE ORDER BY created_at DESC");
+    const result = await db.pool.query("SELECT id, name, phone, created_at, is_online, latitude, longitude, password_plain FROM drivers ORDER BY created_at DESC");
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -327,20 +447,16 @@ app.post('/api/admin/drivers', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
     const result = await db.pool.query(
-      'INSERT INTO users (name, phone, password, password_plain, is_driver) VALUES ($1, $2, $3, $4, TRUE) RETURNING id',
+      'INSERT INTO drivers (name, phone, password, password_plain) VALUES ($1, $2, $3, $4) RETURNING id',
       [name, phone, hashedPassword, password]
     );
     res.json({ success: true, id: result.rows[0].id });
   } catch (err) {
-    console.error('[ADMIN ERROR] Driver creation failed:', {
-      message: err.message,
-      code: err.code,
-      detail: err.detail,
-    });
+    console.error('[ADMIN ERROR] Driver creation failed:', err);
     if (err.code === '23505') {
       res.status(400).json({ error: 'Phone number already registered' });
     } else {
-      res.status(500).json({ error: 'Failed to create driver: ' + (err.message || 'Internal Error') });
+      res.status(500).json({ error: 'Failed to create driver' });
     }
   }
 });
@@ -349,9 +465,7 @@ app.put('/api/admin/drivers/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { name, phone, password } = req.body;
-    console.log('[ADMIN] Updating driver:', { id, name, phone, hasPassword: !!password });
-    
-    let query = 'UPDATE users SET name=$1, phone=$2';
+    let query = 'UPDATE drivers SET name=$1, phone=$2';
     let params = [name, phone];
     
     if (password) {
@@ -367,19 +481,15 @@ app.put('/api/admin/drivers/:id', async (req, res) => {
     await db.pool.query(query, params);
     res.json({ success: true });
   } catch (err) {
-    console.error('[ADMIN ERROR] Driver update failed:', {
-      id,
-      message: err.message,
-      code: err.code,
-    });
-    res.status(500).json({ error: 'Failed to update driver: ' + (err.message || 'Internal Error') });
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update driver' });
   }
 });
 
 app.delete('/api/admin/drivers/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    await db.pool.query('DELETE FROM users WHERE id = $1 AND is_driver = TRUE', [id]);
+    await db.pool.query('DELETE FROM drivers WHERE id = $1', [id]);
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -393,21 +503,10 @@ app.put('/api/driver/status', async (req, res) => {
     const { driver_id, is_online } = req.body;
     console.log('[DRIVER] Updating online status:', { driver_id, is_online });
     
-    await db.pool.query('UPDATE users SET is_online = $1 WHERE id = $2 AND is_driver = TRUE', [is_online, driver_id]);
+    await db.pool.query('UPDATE drivers SET is_online = $1 WHERE id = $2', [is_online, driver_id]);
     res.json({ success: true, is_online });
   } catch (err) {
     console.error('[DRIVER ERROR] Failed to update status:', err);
-    res.status(500).json({ error: 'Failed to update status' });
-  }
-});
-
-app.put('/api/driver/status', async (req, res) => {
-  try {
-    const { driver_id, is_online } = req.body;
-    await db.pool.query('UPDATE users SET is_online = $1 WHERE id = $2', [is_online, driver_id]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
     res.status(500).json({ error: 'Failed to update status' });
   }
 });
@@ -416,7 +515,7 @@ app.put('/api/driver/location', async (req, res) => {
   try {
     const { driver_id, latitude, longitude } = req.body;
     await db.pool.query(
-      'UPDATE users SET latitude = $1, longitude = $2 WHERE id = $3',
+      'UPDATE drivers SET latitude = $1, longitude = $2 WHERE id = $3',
       [latitude, longitude, driver_id]
     );
 
@@ -465,9 +564,10 @@ app.get('/api/driver/:driver_id/history', async (req, res) => {
   try {
     const { driver_id } = req.params;
     const result = await db.pool.query(`
-      SELECT o.*, r.name as restaurant_name 
+      SELECT o.*, r.name as restaurant_name, u.name as user_name
       FROM orders o 
       JOIN restaurants r ON o.restaurant_id = r.id 
+      JOIN users u ON o.user_id = u.id
       WHERE o.driver_id = $1 AND o.status = 'Completed'
       ORDER BY o.created_at DESC
     `, [driver_id]);
@@ -513,11 +613,31 @@ app.put('/api/driver/orders/:id/accept', async (req, res) => {
 app.put('/api/driver/orders/:id/reject', async (req, res) => {
   try {
     const { id } = req.params;
-    await db.pool.query(
-      'UPDATE orders SET driver_id = NULL, is_driver_accepted = false WHERE id = $1',
-      [id]
-    );
-    io.emit('status_updated', { order_id: id, status: 'Driver Rejected' });
+    
+    // Get the current driver and restaurant before nullifying
+    const orderData = await db.pool.query('SELECT driver_id, restaurant_id FROM orders WHERE id = $1', [id]);
+    if (orderData.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    
+    const { driver_id: rejectingDriverId, restaurant_id } = orderData.rows[0];
+
+    if (rejectingDriverId) {
+      await db.pool.query(
+        'UPDATE orders SET driver_id = NULL, is_driver_accepted = false, rejected_by = array_append(rejected_by, $1) WHERE id = $2',
+        [rejectingDriverId, id]
+      );
+    } else {
+      await db.pool.query(
+        'UPDATE orders SET driver_id = NULL, is_driver_accepted = false WHERE id = $1',
+        [id]
+      );
+    }
+    
+    // Notify previous driver (they won't see it anymore)
+    io.emit('status_updated', { order_id: id, status: 'Pending' }); 
+    
+    // Auto-assign to next eligible driver in rotation
+    autoAssignDriver(id, restaurant_id);
+    
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -543,11 +663,18 @@ app.put('/api/driver/orders/:id/pickup', async (req, res) => {
 app.post('/api/driver/complete-delivery', async (req, res) => {
   try {
     const { order_id } = req.body;
-    const earningsPerDelivery = 30; // Base earnings of ₹30 for Karaikudi
+    
+    // Fetch order to get delivery fee and distance for commission calculation
+    const orderData = await db.pool.query('SELECT * FROM orders WHERE id = $1', [order_id]);
+    if (orderData.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    
+    const order = orderData.rows[0];
+    const fees = calculateOrderFees(parseFloat(order.distance || 0));
+    const driverEarnings = fees.driverCommission;
 
     const result = await db.pool.query(
       'UPDATE orders SET status = \'Completed\', driver_earnings = $1 WHERE id = $2 RETURNING *',
-      [earningsPerDelivery, order_id]
+      [driverEarnings, order_id]
     );
 
     const updatedOrder = result.rows[0];
@@ -564,7 +691,9 @@ app.post('/api/driver/complete-delivery', async (req, res) => {
 app.get('/api/restaurants', async (req, res) => {
   try {
     const { sort, category_id, is_veg, min_rating } = req.query;
-    let queryText = 'SELECT * FROM restaurants WHERE 1=1';
+    let queryText = `SELECT r.*, 
+                     (SELECT image_url FROM menu_items m WHERE m.restaurant_id = r.id AND m.image_url IS NOT NULL LIMIT 1) as menu_image_url
+                     FROM restaurants r WHERE r.is_deleted = false AND r.is_active = true`;
     const queryParams = [];
 
     if (category_id) {
@@ -573,7 +702,7 @@ app.get('/api/restaurants', async (req, res) => {
     }
 
     if (is_veg === 'true') {
-      queryText += ' AND is_veg_only = TRUE';
+       queryText += ' AND r.is_veg_only = TRUE';
     }
 
     if (min_rating) {
@@ -581,21 +710,26 @@ app.get('/api/restaurants', async (req, res) => {
       queryText += ` AND rating >= $${queryParams.length}`;
     }
 
-    // Add Sorting Logic
+    // Veg Priority Sorting
+    let orderBy = [];
     if (sort === 'rating') {
-      queryText += ' ORDER BY rating DESC';
-    } else if (sort === 'cost') {
-      queryText += ' ORDER BY cost_for_two ASC';
+      orderBy.push('rating DESC NULLS LAST, display_order ASC');
+    } else if (sort === 'cost_asc' || sort === 'cost') {
+      orderBy.push('cost_for_two ASC, display_order ASC');
+    } else if (sort === 'cost_desc') {
+      orderBy.push('cost_for_two DESC, display_order ASC');
     } else if (sort === 'time') {
-      queryText += ' ORDER BY delivery_time ASC';
+      orderBy.push('delivery_time ASC, display_order ASC');
     } else {
-      queryText += ' ORDER BY rating DESC'; // Default
+      orderBy.push('display_order ASC, id ASC');
     }
+
+    queryText += ' ORDER BY ' + orderBy.join(', ');
 
     const result = await db.pool.query(queryText, queryParams);
     const rows = result.rows.map(r => ({
       ...r,
-      image_url: r.image_url ? getUploadUrl(req, r.image_url) : null
+      image_url: r.menu_image_url ? getUploadUrl(req, r.menu_image_url) : (r.image_url ? getUploadUrl(req, r.image_url) : null)
     }));
     res.json(rows);
   } catch (err) {
@@ -606,7 +740,12 @@ app.get('/api/restaurants', async (req, res) => {
 
 app.get('/api/categories', async (req, res) => {
   try {
-    const result = await db.pool.query('SELECT * FROM categories');
+    const { is_veg } = req.query;
+    let queryText = 'SELECT * FROM categories';
+    if (is_veg === 'true') {
+      queryText += " WHERE veg_type != 'non-veg'";
+    }
+    const result = await db.pool.query(queryText);
     const rows = result.rows.map(r => ({
       ...r,
       image_index: r.id, // for carousel grouping
@@ -622,9 +761,16 @@ app.get('/api/categories', async (req, res) => {
 app.get('/api/restaurants/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await db.pool.query('SELECT * FROM restaurants WHERE id = $1', [id]);
+    const result = await db.pool.query(`
+      SELECT r.*, 
+             (SELECT image_url FROM menu_items m WHERE m.restaurant_id = r.id AND m.image_url IS NOT NULL LIMIT 1) as menu_image_url
+      FROM restaurants r WHERE r.id = $1
+    `, [id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Restaurant not found' });
-    res.json(result.rows[0]);
+    
+    const r = result.rows[0];
+    r.image_url = r.menu_image_url ? getUploadUrl(req, r.menu_image_url) : (r.image_url ? getUploadUrl(req, r.image_url) : null);
+    res.json(r);
   } catch (err) {
     res.status(500).json({ error: 'Database error' });
   }
@@ -644,6 +790,205 @@ app.get('/api/restaurants/:id/menu', async (req, res) => {
   }
 });
 
+// Haversine distance calculation (returns km)
+const haversineDistance = (lat1, lon1, lat2, lon2) => {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+// Fee and Commission Calculation Logic
+const calculateOrderFees = (distance) => {
+  const handlingFee = 9;
+  let deliveryFee = 15;
+  
+  if (distance > 2) {
+    deliveryFee += Math.ceil(distance - 2) * 9;
+  }
+  
+  // New Progressive Admin Commission Logic:
+  // Till 3km: Admin gets 0
+  // 4km: Admin gets 3 (Total 33, Driver 30)
+  // 5km: Admin gets 4 (Total 42, Driver 38)
+  // 6km: Admin gets 5 (Total 51, Driver 46)
+  // Formula: Math.floor(distance) - 1 for distance >= 4
+  
+  const adminDeliveryCut = (distance >= 4) ? (Math.floor(distance) - 1) : 0;
+  const driverEarnings = deliveryFee - adminDeliveryCut;
+  const platformCommission = handlingFee + adminDeliveryCut;
+  
+  return {
+    distance: parseFloat(distance.toFixed(2)),
+    handlingFee,
+    deliveryFee,
+    driverCommission: driverEarnings, // Renaming internally for clarity
+    driverEarnings, 
+    platformCommission
+  };
+};
+
+app.get('/api/orders/calculate-fee', async (req, res) => {
+  try {
+    const { restaurant_id, latitude, longitude } = req.query;
+    if (!restaurant_id || !latitude || !longitude) {
+      return res.status(400).json({ error: 'Missing parameters' });
+    }
+
+    const restResult = await db.pool.query('SELECT latitude, longitude FROM restaurants WHERE id = $1', [restaurant_id]);
+    if (restResult.rows.length === 0) return res.status(404).json({ error: 'Restaurant not found' });
+    
+    const restLat = parseFloat(restResult.rows[0].latitude);
+    const restLng = parseFloat(restResult.rows[0].longitude);
+    const userLat = parseFloat(latitude);
+    const userLng = parseFloat(longitude);
+
+    if (isNaN(restLat) || isNaN(restLng) || isNaN(userLat) || isNaN(userLng)) {
+      return res.status(400).json({ error: 'Invalid coordinates' });
+    }
+
+    const distance = haversineDistance(restLat, restLng, userLat, userLng);
+    const fees = calculateOrderFees(distance);
+    
+    res.json(fees);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to calculate fees' });
+  }
+});
+
+// Auto-assign order to nearest available online driver within 10 km, using rotation (longest waiting)
+const autoAssignDriver = async (orderId, restaurantId) => {
+  try {
+    // Get restaurant coordinates
+    const restResult = await db.pool.query('SELECT latitude, longitude FROM restaurants WHERE id = $1', [restaurantId]);
+    if (restResult.rows.length === 0) return null;
+    const restLat = parseFloat(restResult.rows[0].latitude);
+    const restLng = parseFloat(restResult.rows[0].longitude);
+    if (isNaN(restLat) || isNaN(restLng)) {
+      console.log('[AUTO-ASSIGN] Restaurant has no coordinates, skipping auto-assign');
+      return null;
+    }
+
+    // Get excluded drivers (who rejected)
+    const orderResult = await db.pool.query('SELECT rejected_by FROM orders WHERE id = $1', [orderId]);
+    const rejectedBy = orderResult.rows.length > 0 ? (orderResult.rows[0].rejected_by || []) : [];
+
+    // Get online drivers with coordinates who are NOT currently assigned to ANY active order
+    const driversResult = await db.pool.query(`
+      SELECT 
+        d.id, d.name, d.latitude, d.longitude,
+        (SELECT MAX(created_at) FROM orders o2 WHERE o2.driver_id = d.id AND o2.status = 'Completed') as last_assigned
+      FROM drivers d
+      WHERE d.is_online = true
+        AND d.latitude IS NOT NULL AND d.latitude != ''
+        AND d.longitude IS NOT NULL AND d.longitude != ''
+        AND d.id NOT IN (
+          SELECT COALESCE(o.driver_id, 0) FROM orders o 
+          WHERE o.driver_id IS NOT NULL 
+            AND o.status NOT IN ('Completed', 'Cancelled', 'Driver Rejected')
+        )
+    `);
+
+    const availableDrivers = driversResult.rows.filter(d => !rejectedBy.includes(d.id));
+    console.log(`[AUTO-ASSIGN] Found ${availableDrivers.length} available online drivers`);
+
+    if (availableDrivers.length === 0) {
+      console.log('[AUTO-ASSIGN] No available online drivers found');
+      return null;
+    }
+
+    // Filter by distance (10km)
+    let eligibleDrivers = [];
+    for (const driver of availableDrivers) {
+      const dLat = parseFloat(driver.latitude);
+      const dLng = parseFloat(driver.longitude);
+      if (isNaN(dLat) || isNaN(dLng)) continue;
+
+      const dist = haversineDistance(restLat, restLng, dLat, dLng);
+      if (dist <= 50) { // Increased to 50km for better demo/coverage
+        eligibleDrivers.push({
+          ...driver,
+          distance: dist,
+          last_assigned_time: driver.last_assigned ? new Date(driver.last_assigned).getTime() : 0
+        });
+      }
+    }
+
+    if (eligibleDrivers.length > 0) {
+      // Rotation: Sort primarily by last_assigned_time (older first), secondary by distance
+      eligibleDrivers.sort((a, b) => {
+        if (a.last_assigned_time !== b.last_assigned_time) {
+          return a.last_assigned_time - b.last_assigned_time;
+        }
+        return a.distance - b.distance;
+      });
+
+      const closestDriver = eligibleDrivers[0];
+
+      await db.pool.query(
+        'UPDATE orders SET driver_id = $1, is_driver_accepted = false WHERE id = $2',
+        [closestDriver.id, orderId]
+      );
+      console.log(`[AUTO-ASSIGN] ✅ Assigned driver ${closestDriver.name} (${closestDriver.distance.toFixed(2)} km) to order #${orderId}`);
+      
+      // Notify via socket, avoid overriding status to something the frontend Stepper can't read
+      io.emit('driver_order_assigned', { driver_id: closestDriver.id, order_id: orderId });
+      
+      return closestDriver;
+    } else {
+      console.log('[AUTO-ASSIGN] No drivers within 10 km radius');
+      return null;
+    }
+  } catch (err) {
+    console.error('[AUTO-ASSIGN ERROR]', err);
+    return null;
+  }
+};
+
+app.post('/api/payment/create-order', async (req, res) => {
+  try {
+    const { amount, currency = 'INR' } = req.body;
+    
+    const options = {
+      amount: amount * 100, // Razorpay expects amount in paise
+      currency,
+      receipt: `receipt_order_${Date.now()}`
+    };
+
+    const order = await razorpay.orders.create(options);
+    console.log('[RAZORPAY] Order created:', order.id);
+    res.json(order);
+  } catch (err) {
+    console.error('[RAZORPAY ERROR] Failed to create order:', err);
+    res.status(500).json({ error: 'Failed to create Razorpay order' });
+  }
+});
+
+app.post('/api/payment/verify', async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    const crypto = require('crypto');
+    const hmac = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET);
+    hmac.update(razorpay_order_id + "|" + razorpay_payment_id);
+    const generated_signature = hmac.digest('hex');
+
+    if (generated_signature === razorpay_signature) {
+      console.log('[RAZORPAY] Payment verified:', razorpay_payment_id);
+      res.json({ success: true, message: 'Payment verified successfully' });
+    } else {
+      console.warn('[RAZORPAY] Signature mismatch for order:', razorpay_order_id);
+      res.status(400).json({ success: false, message: 'Invalid signature' });
+    }
+  } catch (err) {
+    console.error('[RAZORPAY ERROR] Verification failed:', err);
+    res.status(500).json({ error: 'Verification failed' });
+  }
+});
+
 app.post('/api/orders', async (req, res) => {
   try {
     const { user_id, restaurant_id, total_amount, items, delivery_address, customer_name, latitude, longitude } = req.body;
@@ -657,10 +1002,29 @@ app.post('/api/orders', async (req, res) => {
     // Start transaction
     await db.pool.query('BEGIN');
     
-    // Insert Order with snapshotted address, name, coordinates and landmark
+    // Calculate distance and fees
+    const restResult = await db.pool.query('SELECT latitude, longitude FROM restaurants WHERE id = $1', [restaurant_id]);
+    let distance = 0;
+    let fees = { handlingFee: 9, deliveryFee: 40, driverCommission: 30, platformCommission: 19 }; // Defaults
+
+    if (restResult.rows.length > 0 && lat !== null && lng !== null) {
+      const restLat = parseFloat(restResult.rows[0].latitude);
+      const restLng = parseFloat(restResult.rows[0].longitude);
+      if (!isNaN(restLat) && !isNaN(restLng)) {
+        distance = haversineDistance(restLat, restLng, lat, lng);
+        fees = calculateOrderFees(distance);
+      }
+    }
+    
+    // Insert Order with snapshotted address, name, coordinates, landmark and fees
     const orderResult = await db.pool.query(
-      'INSERT INTO orders (user_id, restaurant_id, total_amount, delivery_address, customer_name, latitude, longitude, landmark) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
-      [user_id, restaurant_id, total_amount, delivery_address, customer_name, lat, lng, req.body.landmark || null]
+      `INSERT INTO orders 
+       (user_id, restaurant_id, total_amount, delivery_address, customer_name, latitude, longitude, landmark, 
+        distance, delivery_fee, handling_fee, platform_commission, driver_earnings, payment_method, payment_id) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id`,
+      [user_id, restaurant_id, total_amount, delivery_address, customer_name, lat, lng, req.body.landmark || null,
+       fees.distance || distance, fees.deliveryFee, fees.handlingFee, fees.platformCommission, fees.driverCommission || fees.driverEarnings || 0,
+       req.body.payment_method || 'COD', req.body.payment_id || null]
     );
     const orderId = orderResult.rows[0].id;
     
@@ -677,6 +1041,9 @@ app.post('/api/orders', async (req, res) => {
     // Phase 12: Emit new_order event to the restaurant
     io.to(`restaurant_${restaurant_id}`).emit('new_order', { order_id: orderId });
     
+    // Auto-assign nearest available driver (non-blocking)
+    autoAssignDriver(orderId, restaurant_id);
+    
     res.json({ success: true, order_id: orderId });
   } catch (err) {
     await db.pool.query('ROLLBACK');
@@ -692,21 +1059,21 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, phone, address, password } = req.body;
     
-    // Check if user exists
+    // Check if customer exists
     const userExists = await db.pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
-    if (userExists.rows.length > 0) return res.status(400).json({ error: 'User already exists' });
+    if (userExists.rows.length > 0) return res.status(400).json({ error: 'Account already exists' });
 
     // Hash password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const newUser = await db.pool.query(
-      'INSERT INTO users (name, phone, address, password) VALUES ($1, $2, $3, $4) RETURNING id, name, phone, address, is_admin',
+      'INSERT INTO users (name, phone, address, password) VALUES ($1, $2, $3, $4) RETURNING id, name, phone, address',
       [name, phone, address, hashedPassword]
     );
 
     const user = newUser.rows[0];
-    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: user.id, role: 'customer' }, JWT_SECRET, { expiresIn: '7d' });
 
     res.json({ token, user });
   } catch (err) {
@@ -720,16 +1087,13 @@ app.post('/api/auth/login', async (req, res) => {
     const { phone, password } = req.body;
 
     const userResult = await db.pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
-    if (userResult.rows.length === 0) return res.status(400).json({ error: 'Invalid phone or password' });
+    if (userResult.rows.length === 0) return res.status(400).json({ error: 'Account not found' });
 
     const user = userResult.rows[0];
-    
-    if (!user.password) return res.status(400).json({ error: 'Account has no password set' });
-    
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ error: 'Invalid phone or password' });
+    if (!isMatch) return res.status(400).json({ error: 'Invalid credentials' });
 
-    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: user.id, role: 'customer' }, JWT_SECRET, { expiresIn: '7d' });
     
     delete user.password;
     res.json({ token, user });
@@ -739,16 +1103,63 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// --- NEW ISOLATED AUTH ENDPOINTS ---
+
+app.post('/api/driver/login', async (req, res) => {
+  try {
+    const { phone, password } = req.body;
+    const result = await db.pool.query('SELECT * FROM drivers WHERE phone = $1', [phone]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Driver account not found' });
+
+    const driver = result.rows[0];
+    const isMatch = await bcrypt.compare(password, driver.password);
+    if (!isMatch) return res.status(401).json({ error: 'Invalid phone or password' });
+
+    const token = jwt.sign({ id: driver.id, role: 'driver' }, JWT_SECRET, { expiresIn: '30d' });
+    delete driver.password;
+    res.json({ token, user: driver });
+  } catch (err) {
+    console.error('Driver login error:', err);
+    res.status(500).json({ error: 'Server error during login' });
+  }
+});
+
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const { phone, password } = req.body;
+    const result = await db.pool.query('SELECT * FROM admins WHERE phone = $1', [phone]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Admin account not found' });
+
+    const admin = result.rows[0];
+    const isMatch = await bcrypt.compare(password, admin.password);
+    if (!isMatch) return res.status(401).json({ error: 'Invalid phone or password' });
+
+    const token = jwt.sign({ id: admin.id, role: 'admin' }, JWT_SECRET, { expiresIn: '30d' });
+    delete admin.password;
+    res.json({ token, user: admin });
+  } catch (err) {
+    console.error('Admin login error:', err);
+    res.status(500).json({ error: 'Server error during login' });
+  }
+});
+
 // --- VENDOR AUTH ROUTES ---
 app.post('/api/vendor/login', async (req, res) => {
   try {
-    const { restaurant_id, password } = req.body;
-    if (!restaurant_id || !password) return res.status(400).json({ error: 'Missing credentials' });
+    const { restaurant_id, login_id, password } = req.body;
+    if ((!restaurant_id && !login_id) || !password) return res.status(400).json({ error: 'Missing credentials' });
 
-    const result = await db.pool.query('SELECT * FROM restaurants WHERE id = $1', [parseInt(restaurant_id)]);
+    let result;
+    if (login_id) {
+      // Login via login_id (string username)
+      result = await db.pool.query('SELECT * FROM restaurants WHERE login_id = $1', [login_id.trim()]);
+    } else {
+      // Login via numeric restaurant_id (legacy)
+      result = await db.pool.query('SELECT * FROM restaurants WHERE id = $1', [parseInt(restaurant_id)]);
+    }
     
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Restaurant ID not found' });
+      return res.status(401).json({ error: login_id ? 'Login ID not found' : 'Restaurant ID not found' });
     }
 
     const restaurant = result.rows[0];
@@ -779,28 +1190,41 @@ app.get('/api/search', async (req, res) => {
   try {
     const { q } = req.query;
     if (!q) return res.json({ restaurants: [], items: [] });
+    const words = q.trim().split(/\s+/);
+    const searchParam = `%${words.join('%')}%`; // Allows "chi bri" to match "chicken briyani"
     
-    const searchParam = `%${q}%`;
-    
-    // Search restaurants by name
+    // Search restaurants by name (fuzzy + partial)
     const restResult = await db.pool.query(
-      'SELECT * FROM restaurants WHERE name ILIKE $1',
-      [searchParam]
+      `SELECT r.*,
+             (SELECT image_url FROM menu_items mi WHERE mi.restaurant_id = r.id AND mi.image_url IS NOT NULL LIMIT 1) as menu_image_url
+       FROM restaurants r 
+       WHERE r.name ILIKE $1 
+          OR similarity(r.name, $2) > 0.1
+          OR word_similarity($2, r.name) > 0.1
+       ORDER BY 
+          CASE WHEN r.name ILIKE $1 THEN 1 ELSE 0 END DESC,
+          GREATEST(similarity(r.name, $2), word_similarity($2, r.name)) DESC`,
+      [searchParam, q]
     );
 
-    // Search menu items by name, returning the joined restaurant info
+    // Search menu items by name, returning the joined restaurant info (fuzzy + partial)
     const itemResult = await db.pool.query(
       `SELECT m.*, r.name as restaurant_name 
        FROM menu_items m 
        JOIN restaurants r ON m.restaurant_id = r.id 
-       WHERE m.name ILIKE $1`,
-      [searchParam]
+       WHERE m.name ILIKE $1 
+          OR similarity(m.name, $2) > 0.1
+          OR word_similarity($2, m.name) > 0.1
+       ORDER BY 
+          CASE WHEN m.name ILIKE $1 THEN 1 ELSE 0 END DESC,
+          GREATEST(similarity(m.name, $2), word_similarity($2, m.name)) DESC`,
+      [searchParam, q]
     );
 
     res.json({
       restaurants: restResult.rows.map(r => ({
         ...r,
-        image_url: r.image_url ? getUploadUrl(req, r.image_url) : null
+        image_url: r.menu_image_url ? getUploadUrl(req, r.menu_image_url) : (r.image_url ? getUploadUrl(req, r.image_url) : null)
       })),
       items: itemResult.rows.map(m => ({
         ...m,
@@ -863,10 +1287,12 @@ app.get('/api/orders/:id', async (req, res) => {
         d.name as driver_name,
         d.phone as driver_phone,
         d.latitude as driver_lat,
-        d.longitude as driver_lng
+        d.longitude as driver_lng,
+        u.phone as customer_phone
       FROM orders o
       JOIN restaurants r ON o.restaurant_id = r.id
-      LEFT JOIN users d ON o.driver_id = d.id
+      LEFT JOIN drivers d ON o.driver_id = d.id
+      LEFT JOIN users u ON o.user_id = u.id
       WHERE o.id = $1
     `, [id]);
     
@@ -947,14 +1373,16 @@ app.get('/api/user/:user_id/favorites', async (req, res) => {
   try {
     const { user_id } = req.params;
     const result = await db.pool.query(
-      `SELECT r.* FROM restaurants r 
+      `SELECT r.*,
+             (SELECT image_url FROM menu_items m WHERE m.restaurant_id = r.id AND m.image_url IS NOT NULL LIMIT 1) as menu_image_url
+       FROM restaurants r 
        JOIN favorites f ON r.id = f.restaurant_id 
        WHERE f.user_id = $1`, 
       [user_id]
     );
     const restaurants = result.rows.map(r => ({
       ...r,
-      image_url: r.image_url ? getUploadUrl(req, r.image_url) : null
+      image_url: r.menu_image_url ? getUploadUrl(req, r.menu_image_url) : (r.image_url ? getUploadUrl(req, r.image_url) : null)
     }));
     res.json(restaurants);
   } catch (err) {
@@ -1212,6 +1640,57 @@ app.put('/api/orders/:order_id/status', async (req, res) => {
   } catch (err) {
     console.error('Failed to update status:', err);
     res.status(500).json({ error: 'Failed to update order status' });
+  }
+});
+
+app.put('/api/admin/menu-items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description, price, is_veg, category_id, image_url } = req.body;
+    await db.pool.query(
+      'UPDATE menu_items SET name = $1, description = $2, price = $3, is_veg = $4, category_id = $5, image_url = $6 WHERE id = $7',
+      [name, description, price, is_veg, category_id || null, image_url || null, id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update menu item' });
+  }
+});
+
+app.put('/api/admin/menu-items/:id/availability', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { is_available } = req.body;
+    await db.pool.query('UPDATE menu_items SET is_available = $1 WHERE id = $2', [is_available, id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update availability' });
+  }
+});
+
+app.delete('/api/admin/menu-items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.pool.query('DELETE FROM menu_items WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete menu item' });
+  }
+});
+
+
+app.put('/api/vendor/:id/veg-status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { is_veg_only } = req.body;
+    await db.pool.query('UPDATE restaurants SET is_veg_only = $1 WHERE id = $2', [is_veg_only, id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update veg status' });
   }
 });
 
