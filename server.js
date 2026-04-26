@@ -7,6 +7,7 @@ const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Razorpay = require('razorpay');
+const fetch = require('node-fetch');
 
 // Simple JSON Logger
 const logger = (req, res, next) => {
@@ -118,16 +119,56 @@ db.pool.query('SELECT NOW()', (err, res) => {
   }
 });
 
+// Proxy for Google Places Autocomplete to avoid CORS on web
+app.get('/api/location/search', async (req, res) => {
+  try {
+    const { input } = req.query;
+    if (!input) return res.json({ predictions: [] });
+    
+    const apiKey = 'AIzaSyCQstmhdPUAGpwxkOofOZFwLed_I0vTU4o'; // Google Maps Key
+    const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&key=${apiKey}&components=country:in`;
+    
+    const response = await fetch(url);
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    console.error('[PROXY ERROR]', err);
+    res.status(500).json({ error: 'Failed to fetch location predictions' });
+  }
+});
+
+app.get('/api/location/details', async (req, res) => {
+  try {
+    const { place_id } = req.query;
+    if (!place_id) return res.status(400).json({ error: 'place_id is required' });
+    
+    const apiKey = 'AIzaSyCQstmhdPUAGpwxkOofOZFwLed_I0vTU4o'; // Google Maps Key
+    const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${place_id}&fields=geometry&key=${apiKey}`;
+    
+    const response = await fetch(url);
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    console.error('[DETAILS PROXY ERROR]', err);
+    res.status(500).json({ error: 'Failed to fetch location details' });
+  }
+});
+
 app.get('/api/search/category/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { is_veg } = req.query;
+    // Get category name for fuzzy matching
+    const catRes = await db.pool.query('SELECT name FROM categories WHERE id = $1', [id]);
+    const catName = catRes.rows.length > 0 ? catRes.rows[0].name : '';
+
     let queryText = `
       SELECT m.*, r.name as restaurant_name, r.address as restaurant_address, r.image_url as restaurant_image
       FROM menu_items m
       JOIN restaurants r ON m.restaurant_id = r.id
-      WHERE m.category_id = $1 AND m.is_available = true
+      WHERE (m.category_id = $1 OR m.name ILIKE $2) AND m.is_available = true
     `;
+    const params = [id, `%${catName}%`];
     
     if (is_veg === 'true') {
       queryText += ' AND m.is_veg = true ORDER BY m.id ASC';
@@ -135,7 +176,7 @@ app.get('/api/search/category/:id', async (req, res) => {
       queryText += ' ORDER BY m.id ASC';
     }
 
-    const result = await db.pool.query(queryText, [id]);
+    const result = await db.pool.query(queryText, params);
     const rows = result.rows.map(r => ({
       ...r,
       image_url: r.image_url ? getUploadUrl(req, r.image_url) : null,
@@ -287,15 +328,15 @@ app.put('/api/admin/restaurants/:id/status', async (req, res) => {
 // Admin: Enhanced Restaurant Management
 app.post('/api/admin/restaurants', async (req, res) => {
   try {
-    const { name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id, login_id } = req.body;
+    const { name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id, login_id, rating, reviews_count } = req.body;
     
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const result = await db.pool.query(
-      `INSERT INTO restaurants (name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, password_plain, category_id, is_active, login_id) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11) RETURNING id`,
-      [name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, hashedPassword, password, category_id, login_id || null]
+      `INSERT INTO restaurants (name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, password_plain, category_id, is_active, login_id, rating, reviews_count, latitude, longitude) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11, $12, $13, $14, $15) RETURNING id`,
+      [name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, hashedPassword, password, category_id, login_id || null, rating || 0, reviews_count || 0, latitude || null, longitude || null]
     );
     
     res.json({ success: true, id: result.rows[0].id });
@@ -311,18 +352,18 @@ app.post('/api/admin/restaurants', async (req, res) => {
 app.put('/api/admin/restaurants/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id, login_id } = req.body;
+    const { name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id, login_id, rating, reviews_count, latitude, longitude } = req.body;
     
-    let query = 'UPDATE restaurants SET name=$1, address=$2, cuisines=$3, delivery_time=$4, cost_for_two=$5, is_veg_only=$6, image_url=$7, category_id=$8, login_id=$9';
-    let params = [name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, category_id, login_id || null];
+    let query = 'UPDATE restaurants SET name=$1, address=$2, cuisines=$3, delivery_time=$4, cost_for_two=$5, is_veg_only=$6, image_url=$7, category_id=$8, login_id=$9, rating=$10, reviews_count=$11, latitude=$12, longitude=$13';
+    let params = [name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, category_id, login_id || null, rating || 0, reviews_count || 0, latitude || null, longitude || null];
     
     if (password) {
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
-      query += ', password=$10, password_plain=$11 WHERE id=$12';
+      query += ', password=$14, password_plain=$15 WHERE id=$16';
       params.push(hashedPassword, password, id);
     } else {
-      query += ' WHERE id=$10';
+      query += ' WHERE id=$14';
       params.push(id);
     }
     
@@ -669,20 +710,48 @@ app.post('/api/driver/complete-delivery', async (req, res) => {
     if (orderData.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
     
     const order = orderData.rows[0];
+    if (order.status === 'Completed') return res.status(400).json({ error: 'Order already completed' });
+
     const fees = calculateOrderFees(parseFloat(order.distance || 0));
     const driverEarnings = fees.driverCommission;
+    // Restaurant earnings = Total - Platform Commission - Delivery Fee
+    const restaurantEarnings = order.total_amount - fees.platformCommission - fees.deliveryFee;
 
+    await db.pool.query('BEGIN');
+
+    // 1. Update Order Status and Earnings
     const result = await db.pool.query(
-      'UPDATE orders SET status = \'Completed\', driver_earnings = $1 WHERE id = $2 RETURNING *',
-      [driverEarnings, order_id]
+      'UPDATE orders SET status = \'Completed\', driver_earnings = $1, platform_commission = $2 WHERE id = $3 RETURNING *',
+      [driverEarnings, fees.platformCommission, order_id]
     );
+
+    // 2. Credit Driver Wallet
+    await db.pool.query('UPDATE drivers SET wallet_balance = wallet_balance + $1 WHERE id = $2', [driverEarnings, order.driver_id]);
+
+    // 3. Credit Restaurant Wallet
+    await db.pool.query('UPDATE restaurants SET wallet_balance = wallet_balance + $1 WHERE id = $2', [restaurantEarnings, order.restaurant_id]);
+
+    // 4. Handle Referral Logic (If it's user's first order)
+    const orderCount = await db.pool.query('SELECT COUNT(*) FROM orders WHERE user_id = $1 AND status = \'Completed\'', [order.user_id]);
+    if (parseInt(orderCount.rows[0].count) === 0) {
+      const userRes = await db.pool.query('SELECT referred_by FROM users WHERE id = $1', [order.user_id]);
+      const referrerId = userRes.rows[0]?.referred_by;
+      if (referrerId) {
+        // Credit referrer with 100 "Veg Coins"
+        await db.pool.query('UPDATE users SET wallet_balance = wallet_balance + 100 WHERE id = $1', [referrerId]);
+        console.log(`[REFERRAL] Credited 100 to user ${referrerId} for referring user ${order.user_id}`);
+      }
+    }
+
+    await db.pool.query('COMMIT');
 
     const updatedOrder = result.rows[0];
     io.emit('status_updated', { order_id: updatedOrder.id, status: 'Completed' });
 
     res.json(updatedOrder);
   } catch (err) {
-    console.error(err);
+    await db.pool.query('ROLLBACK');
+    console.error('[DELIVERY ERROR]', err);
     res.status(500).json({ error: 'Failed to complete delivery' });
   }
 });
@@ -697,8 +766,14 @@ app.get('/api/restaurants', async (req, res) => {
     const queryParams = [];
 
     if (category_id) {
+      // Get category name for fuzzy matching in restaurant items
+      const catRes = await db.pool.query('SELECT name FROM categories WHERE id = $1', [category_id]);
+      const catName = catRes.rows.length > 0 ? catRes.rows[0].name : '';
+
       queryParams.push(category_id);
-      queryText += ` AND category_id = $${queryParams.length}`;
+      queryParams.push(`%${catName}%`);
+      // Filter restaurants that either belong to the category or have menu items matching name/category
+      queryText += ` AND (r.category_id = $${queryParams.length - 1} OR EXISTS (SELECT 1 FROM menu_items m WHERE m.restaurant_id = r.id AND (m.category_id = $${queryParams.length - 1} OR m.name ILIKE $${queryParams.length})))`;
     }
 
     if (is_veg === 'true') {
@@ -710,7 +785,7 @@ app.get('/api/restaurants', async (req, res) => {
       queryText += ` AND rating >= $${queryParams.length}`;
     }
 
-    // Veg Priority Sorting
+    // Sorting Logic
     let orderBy = [];
     if (sort === 'rating') {
       orderBy.push('rating DESC NULLS LAST, display_order ASC');
@@ -719,9 +794,10 @@ app.get('/api/restaurants', async (req, res) => {
     } else if (sort === 'cost_desc') {
       orderBy.push('cost_for_two DESC, display_order ASC');
     } else if (sort === 'time') {
-      orderBy.push('delivery_time ASC, display_order ASC');
+      // Extract the first number from '30-35 mins' for proper numeric sorting
+      orderBy.push("NULLIF(regexp_replace(delivery_time, '[^0-9].*', '', 'g'), '')::INT ASC, display_order ASC");
     } else {
-      orderBy.push('display_order ASC, id ASC');
+      orderBy.push('display_order ASC, r.id ASC');
     }
 
     queryText += ' ORDER BY ' + orderBy.join(', ');
@@ -743,7 +819,7 @@ app.get('/api/categories', async (req, res) => {
     const { is_veg } = req.query;
     let queryText = 'SELECT * FROM categories';
     if (is_veg === 'true') {
-      queryText += " WHERE veg_type != 'non-veg'";
+      queryText += " WHERE LOWER(veg_type) != 'non-veg'";
     }
     const result = await db.pool.query(queryText);
     const rows = result.rows.map(r => ({
@@ -834,28 +910,39 @@ const calculateOrderFees = (distance) => {
 app.get('/api/orders/calculate-fee', async (req, res) => {
   try {
     const { restaurant_id, latitude, longitude } = req.query;
+    console.log(`[FEE_CALC] Request: rest=${restaurant_id}, lat=${latitude}, lng=${longitude}`);
+
     if (!restaurant_id || !latitude || !longitude) {
+      console.log('[FEE_CALC] Error: Missing parameters');
       return res.status(400).json({ error: 'Missing parameters' });
     }
 
-    const restResult = await db.pool.query('SELECT latitude, longitude FROM restaurants WHERE id = $1', [restaurant_id]);
-    if (restResult.rows.length === 0) return res.status(404).json({ error: 'Restaurant not found' });
+    const restResult = await db.pool.query('SELECT name, latitude, longitude FROM restaurants WHERE id = $1', [restaurant_id]);
+    if (restResult.rows.length === 0) {
+      console.log(`[FEE_CALC] Error: Restaurant ${restaurant_id} not found`);
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
     
+    const restName = restResult.rows[0].name;
     const restLat = parseFloat(restResult.rows[0].latitude);
     const restLng = parseFloat(restResult.rows[0].longitude);
     const userLat = parseFloat(latitude);
     const userLng = parseFloat(longitude);
 
+    console.log(`[FEE_CALC] Data: Restaurant="${restName}" (${restLat}, ${restLng}), User=(${userLat}, ${userLng})`);
+
     if (isNaN(restLat) || isNaN(restLng) || isNaN(userLat) || isNaN(userLng)) {
+      console.log('[FEE_CALC] Error: Invalid coordinates (NaN)');
       return res.status(400).json({ error: 'Invalid coordinates' });
     }
 
     const distance = haversineDistance(restLat, restLng, userLat, userLng);
     const fees = calculateOrderFees(distance);
     
+    console.log(`[FEE_CALC] Success: Distance=${distance.toFixed(2)} km, Fee=₹${fees.deliveryFee}`);
     res.json(fees);
   } catch (err) {
-    console.error(err);
+    console.error('[FEE_CALC] Critical error:', err);
     res.status(500).json({ error: 'Failed to calculate fees' });
   }
 });
@@ -991,7 +1078,10 @@ app.post('/api/payment/verify', async (req, res) => {
 
 app.post('/api/orders', async (req, res) => {
   try {
-    const { user_id, restaurant_id, total_amount, items, delivery_address, customer_name, latitude, longitude } = req.body;
+    const { 
+      user_id, restaurant_id, total_amount, items, delivery_address, customer_name, latitude, longitude,
+      secondary_contact_name, secondary_contact_phone, subtotal 
+    } = req.body;
     
     // Explicitly parse coordinates as numbers to avoid null/string conversion issues in DB
     const lat = latitude !== null && latitude !== undefined ? Number(latitude) : null;
@@ -1015,16 +1105,26 @@ app.post('/api/orders', async (req, res) => {
         fees = calculateOrderFees(distance);
       }
     }
+
+    // Apply Free Delivery/Handling offer if subtotal > 1000
+    // Apply 20% Delivery Discount if subtotal > 700
+    // Driver still gets paid their full commission, admin absorbs the cost.
+    const isFree = subtotal > 1000;
+    const hasDiscount = subtotal > 700 && !isFree;
+    const finalDeliveryFee = isFree ? 0 : (hasDiscount ? Math.round(fees.deliveryFee * 0.8) : fees.deliveryFee);
+    const finalHandlingFee = isFree ? 0 : fees.handlingFee;
     
     // Insert Order with snapshotted address, name, coordinates, landmark and fees
     const orderResult = await db.pool.query(
       `INSERT INTO orders 
        (user_id, restaurant_id, total_amount, delivery_address, customer_name, latitude, longitude, landmark, 
-        distance, delivery_fee, handling_fee, platform_commission, driver_earnings, payment_method, payment_id) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id`,
+        distance, delivery_fee, handling_fee, platform_commission, driver_earnings, payment_method, payment_id,
+        secondary_contact_name, secondary_contact_phone) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING id`,
       [user_id, restaurant_id, total_amount, delivery_address, customer_name, lat, lng, req.body.landmark || null,
-       fees.distance || distance, fees.deliveryFee, fees.handlingFee, fees.platformCommission, fees.driverCommission || fees.driverEarnings || 0,
-       req.body.payment_method || 'COD', req.body.payment_id || null]
+       fees.distance || distance, finalDeliveryFee, finalHandlingFee, fees.platformCommission, fees.driverCommission || fees.driverEarnings || 0,
+       req.body.payment_method || 'COD', req.body.payment_id || null,
+       secondary_contact_name || null, secondary_contact_phone || null]
     );
     const orderId = orderResult.rows[0].id;
     
@@ -1103,6 +1203,40 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+app.post('/api/auth/phone-login', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone number required' });
+
+    // Clean phone number (strip +91 and spaces)
+    const cleanPhone = phone.replace('+91', '').replace(/\s/g, '').trim();
+
+    // Check if user exists
+    let result = await db.pool.query('SELECT * FROM users WHERE phone = $1', [cleanPhone]);
+    let user;
+
+    if (result.rows.length === 0) {
+      // Auto-register new user
+      const insertResult = await db.pool.query(
+        'INSERT INTO users (name, phone, address) VALUES ($1, $2, $3) RETURNING *',
+        ['New Customer', cleanPhone, '']
+      );
+      user = insertResult.rows[0];
+      console.log('[AUTH] New user auto-registered via phone:', cleanPhone);
+    } else {
+      user = result.rows[0];
+    }
+
+    const token = jwt.sign({ id: user.id, role: 'customer' }, JWT_SECRET, { expiresIn: '30d' });
+    delete user.password;
+    
+    res.json({ token, user });
+  } catch (err) {
+    console.error('[AUTH ERROR] Phone login failed:', err);
+    res.status(500).json({ error: 'Server error during phone login' });
+  }
+});
+
 // --- NEW ISOLATED AUTH ENDPOINTS ---
 
 app.post('/api/driver/login', async (req, res) => {
@@ -1172,7 +1306,7 @@ app.post('/api/vendor/login', async (req, res) => {
     const token = jwt.sign(
       { restaurant_id: restaurant.id },
       JWT_SECRET,
-      { expiresIn: '30d' }
+      { expiresIn: '365d' }
     );
 
     res.json({ 
@@ -1719,6 +1853,197 @@ app.use((err, req, res, next) => {
       ? 'An internal server error occurred' 
       : err.message
   });
+});
+
+// --- PHASE 2 & 3: WALLETS, CHAT & SUBSCRIPTIONS ---
+
+// 1. Payout Requests
+app.post('/api/payouts/request', async (req, res) => {
+  try {
+    const { user_type, user_id, amount } = req.body;
+    
+    // Check balance
+    let balanceRes;
+    if (user_type === 'driver') {
+      balanceRes = await db.pool.query('SELECT wallet_balance FROM drivers WHERE id = $1', [user_id]);
+    } else {
+      balanceRes = await db.pool.query('SELECT wallet_balance FROM restaurants WHERE id = $1', [user_id]);
+    }
+
+    if (balanceRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const balance = parseFloat(balanceRes.rows[0].wallet_balance);
+
+    if (amount > balance) return res.status(400).json({ error: 'Insufficient balance' });
+
+    // Create request with 'pending' status
+    await db.pool.query(
+      'INSERT INTO payout_requests (user_type, user_id, amount, status) VALUES ($1, $2, $3, $4)',
+      [user_type, user_id, amount, 'pending']
+    );
+
+    await db.pool.query('COMMIT');
+    res.json({ success: true, message: 'Payout request submitted successfully' });
+  } catch (err) {
+    await db.pool.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Failed to submit payout request' });
+  }
+});
+
+// Admin: Get all payout requests
+app.get('/api/admin/payouts', async (req, res) => {
+  try {
+    const result = await db.pool.query(`
+      SELECT p.*, 
+             CASE WHEN p.user_type = 'driver' THEN d.name ELSE r.name END as user_name,
+             CASE WHEN p.user_type = 'driver' THEN d.phone ELSE r.phone END as user_phone
+      FROM payout_requests p
+      LEFT JOIN drivers d ON p.user_type = 'driver' AND p.user_id = d.id
+      LEFT JOIN restaurants r ON p.user_type = 'restaurant' AND p.user_id = r.id
+      ORDER BY p.requested_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch payout requests' });
+  }
+});
+
+// Admin: Approve Payout
+app.put('/api/admin/payouts/:id/approve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.pool.query('BEGIN');
+
+    // Get request details
+    const requestRes = await db.pool.query('SELECT * FROM payout_requests WHERE id = $1', [id]);
+    if (requestRes.rows.length === 0) {
+      await db.pool.query('ROLLBACK');
+      return res.status(404).json({ error: 'Request not found' });
+    }
+
+    const request = requestRes.rows[0];
+    if (request.status !== 'pending') {
+      await db.pool.query('ROLLBACK');
+      return res.status(400).json({ error: 'Request already processed' });
+    }
+
+    // Deduct from wallet now
+    if (request.user_type === 'driver') {
+      await db.pool.query('UPDATE drivers SET wallet_balance = wallet_balance - $1 WHERE id = $2', [request.amount, request.user_id]);
+    } else {
+      await db.pool.query('UPDATE restaurants SET wallet_balance = wallet_balance - $1 WHERE id = $2', [request.amount, request.user_id]);
+    }
+
+    // Update status
+    await db.pool.query(
+      'UPDATE payout_requests SET status = $1, processed_at = NOW() WHERE id = $2',
+      ['approved', id]
+    );
+
+    await db.pool.query('COMMIT');
+    res.json({ success: true, message: 'Payout approved and deducted' });
+  } catch (err) {
+    await db.pool.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Failed to approve payout' });
+  }
+});
+
+// Admin: Reject Payout
+app.put('/api/admin/payouts/:id/reject', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.pool.query(
+      "UPDATE payout_requests SET status = 'rejected', processed_at = NOW() WHERE id = $1",
+      [id]
+    );
+    res.json({ success: true, message: 'Payout rejected' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to reject payout' });
+  }
+});
+app.post('/api/messages', async (req, res) => {
+  try {
+    const { order_id, sender_type, sender_id, message } = req.body;
+    const result = await db.pool.query(
+      'INSERT INTO messages (order_id, sender_type, sender_id, message) VALUES ($1, $2, $3, $4) RETURNING *',
+      [order_id, sender_type, sender_id, message]
+    );
+    
+    // Broadcast to room
+    io.to(`order_${order_id}`).emit('new_message', result.rows[0]);
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+app.get('/api/orders/:id/messages', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.pool.query('SELECT * FROM messages WHERE order_id = $1 ORDER BY created_at ASC', [id]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// 3. Subscriptions
+app.post('/api/subscriptions/purchase', async (req, res) => {
+  try {
+    const { user_id, plan_name, price, duration_days } = req.body;
+    const endDate = new Date();
+    endDate.setDate(endDate.getDate() + duration_days);
+
+    const result = await db.pool.query(
+      'INSERT INTO subscriptions (user_id, plan_name, price, end_date) VALUES ($1, $2, $3, $4) RETURNING *',
+      [user_id, plan_name, price, endDate]
+    );
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to purchase subscription' });
+  }
+});
+
+// 4. Referral / Wallet Info
+app.get('/api/user/:id/wallet', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.pool.query('SELECT wallet_balance, referral_code FROM users WHERE id = $1', [id]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch wallet info' });
+  }
+});
+
+app.get('/api/driver/:id/wallet', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.pool.query('SELECT wallet_balance FROM drivers WHERE id = $1', [id]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch driver wallet' });
+  }
+});
+
+app.get('/api/vendor/:id/wallet', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.pool.query('SELECT wallet_balance FROM restaurants WHERE id = $1', [id]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch vendor wallet' });
+  }
 });
 
 // Start the server
