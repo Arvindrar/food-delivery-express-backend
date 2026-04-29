@@ -761,7 +761,7 @@ app.get('/api/restaurants', async (req, res) => {
   try {
     const { sort, category_id, is_veg, min_rating } = req.query;
     let queryText = `SELECT r.*, 
-                     (SELECT image_url FROM menu_items m WHERE m.restaurant_id = r.id AND m.image_url IS NOT NULL LIMIT 1) as menu_image_url
+                     (SELECT image_url FROM menu_items m WHERE m.restaurant_id = r.id AND m.image_url IS NOT NULL AND m.image_url != '' ORDER BY price DESC LIMIT 1) as menu_image_url
                      FROM restaurants r WHERE r.is_deleted = false AND r.is_active = true`;
     const queryParams = [];
 
@@ -803,10 +803,14 @@ app.get('/api/restaurants', async (req, res) => {
     queryText += ' ORDER BY ' + orderBy.join(', ');
 
     const result = await db.pool.query(queryText, queryParams);
-    const rows = result.rows.map(r => ({
-      ...r,
-      image_url: r.menu_image_url ? getUploadUrl(req, r.menu_image_url) : (r.image_url ? getUploadUrl(req, r.image_url) : null)
-    }));
+    const rows = result.rows.map(r => {
+      // Priority: 1. menu_image_url (if not empty), 2. restaurant's own image_url (if not empty)
+      let rawImage = (r.menu_image_url && r.menu_image_url.trim() !== '') ? r.menu_image_url : r.image_url;
+      return {
+        ...r,
+        image_url: (rawImage && rawImage.trim() !== '') ? getUploadUrl(req, rawImage) : null
+      };
+    });
     res.json(rows);
   } catch (err) {
     console.error(err);
@@ -1095,7 +1099,7 @@ app.post('/api/orders', async (req, res) => {
     // Calculate distance and fees
     const restResult = await db.pool.query('SELECT latitude, longitude FROM restaurants WHERE id = $1', [restaurant_id]);
     let distance = 0;
-    let fees = { handlingFee: 9, deliveryFee: 40, driverCommission: 30, platformCommission: 19 }; // Defaults
+    let fees = { distance: 0, handlingFee: 9, deliveryFee: 40, driverCommission: 30, platformCommission: 19 }; // Defaults
 
     if (restResult.rows.length > 0 && lat !== null && lng !== null) {
       const restLat = parseFloat(restResult.rows[0].latitude);
@@ -1227,7 +1231,7 @@ app.post('/api/auth/phone-login', async (req, res) => {
       user = result.rows[0];
     }
 
-    const token = jwt.sign({ id: user.id, role: 'customer' }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ id: user.id, role: 'customer' }, process.env.JWT_SECRET || 'secret', { expiresIn: '30d' });
     delete user.password;
     
     res.json({ token, user });
@@ -1855,6 +1859,8 @@ app.use((err, req, res, next) => {
   });
 });
 
+
+
 // --- PHASE 2 & 3: WALLETS, CHAT & SUBSCRIPTIONS ---
 
 // 1. Payout Requests
@@ -2044,6 +2050,11 @@ app.get('/api/vendor/:id/wallet', async (req, res) => {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch vendor wallet' });
   }
+});
+
+// Final 404 handler for API (must be last)
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found', path: req.originalUrl });
 });
 
 // Start the server
