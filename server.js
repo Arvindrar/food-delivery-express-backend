@@ -35,10 +35,15 @@ app.use('/api/uploads', express.static(path.join(__dirname, 'public/uploads')));
 // Load environment variables
 dotenv.config();
 
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET
-});
+let razorpay;
+if (process.env.RAZORPAY_KEY_ID) {
+  razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET
+  });
+} else {
+  console.warn('[WARNING] Razorpay Key ID missing. Payment features will be disabled.');
+}
 
 const db = require('./config/db');
 
