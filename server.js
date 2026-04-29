@@ -84,9 +84,7 @@ app.use((err, req, res, next) => {
   });
 
   res.status(err.status || 500).json({
-    error: process.env.NODE_ENV === 'production' 
-      ? 'An internal server error occurred' 
-      : err.message
+    error: err.message || 'An internal server error occurred'
   });
 });
 
