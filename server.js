@@ -807,8 +807,8 @@ app.get('/api/restaurants', async (req, res) => {
 
     const result = await db.pool.query(queryText, queryParams);
     const rows = result.rows.map(r => {
-      // Priority: 1. menu_image_url (if not empty), 2. restaurant's own image_url (if not empty)
-      let rawImage = (r.menu_image_url && r.menu_image_url.trim() !== '') ? r.menu_image_url : r.image_url;
+      // Priority: 1. restaurant's own image_url (if not empty), 2. menu_image_url (if not empty)
+      let rawImage = (r.image_url && r.image_url.trim() !== '') ? r.image_url : r.menu_image_url;
       return {
         ...r,
         image_url: (rawImage && rawImage.trim() !== '') ? getUploadUrl(req, rawImage) : null
@@ -852,7 +852,7 @@ app.get('/api/restaurants/:id', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({ error: 'Restaurant not found' });
     
     const r = result.rows[0];
-    r.image_url = r.menu_image_url ? getUploadUrl(req, r.menu_image_url) : (r.image_url ? getUploadUrl(req, r.image_url) : null);
+    r.image_url = r.image_url ? getUploadUrl(req, r.image_url) : (r.menu_image_url ? getUploadUrl(req, r.menu_image_url) : null);
     res.json(r);
   } catch (err) {
     res.status(500).json({ error: 'Database error' });
