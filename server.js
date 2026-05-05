@@ -331,7 +331,7 @@ app.put('/api/admin/restaurants/:id/status', async (req, res) => {
 // Admin: Enhanced Restaurant Management
 app.post('/api/admin/restaurants', async (req, res) => {
   try {
-    const { name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id, login_id, rating, reviews_count } = req.body;
+    const { name, address, cuisines, delivery_time, cost_for_two, is_veg_only, image_url, password, category_id, login_id, rating, reviews_count, latitude, longitude } = req.body;
     
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
@@ -577,7 +577,7 @@ app.get('/api/driver/:driver_id/active-orders', async (req, res) => {
   try {
     const { driver_id } = req.params;
     const orders = await db.pool.query(`
-      SELECT o.*, r.name as restaurant_name, r.address as restaurant_address, u.name as user_name, u.address as user_address 
+      SELECT o.*, r.name as restaurant_name, r.address as restaurant_address, u.name as user_name, u.address as user_address, u.phone as user_phone
       FROM orders o
       JOIN restaurants r ON o.restaurant_id = r.id
       JOIN users u ON o.user_id = u.id
@@ -608,7 +608,7 @@ app.get('/api/driver/:driver_id/history', async (req, res) => {
   try {
     const { driver_id } = req.params;
     const result = await db.pool.query(`
-      SELECT o.*, r.name as restaurant_name, u.name as user_name
+      SELECT o.*, r.name as restaurant_name, u.name as user_name, u.phone as user_phone
       FROM orders o 
       JOIN restaurants r ON o.restaurant_id = r.id 
       JOIN users u ON o.user_id = u.id
@@ -626,9 +626,10 @@ app.get('/api/driver/:driver_id/available-orders', async (req, res) => {
   try {
     const { driver_id } = req.params;
     const orders = await db.pool.query(`
-      SELECT o.*, r.name as restaurant_name, r.address as restaurant_address
+      SELECT o.*, r.name as restaurant_name, r.address as restaurant_address, u.name as user_name, u.phone as user_phone
       FROM orders o
       JOIN restaurants r ON o.restaurant_id = r.id
+      JOIN users u ON o.user_id = u.id
       WHERE o.driver_id = $1 AND o.is_driver_accepted = false
     `, [driver_id]);
     res.json(orders.rows);
@@ -728,8 +729,19 @@ app.post('/api/driver/complete-delivery', async (req, res) => {
       [driverEarnings, fees.platformCommission, order_id]
     );
 
-    // 2. Credit Driver Wallet
-    await db.pool.query('UPDATE drivers SET wallet_balance = wallet_balance + $1 WHERE id = $2', [driverEarnings, order.driver_id]);
+    // 2. Update Driver Wallet based on Payment Method
+    if (order.payment_method === 'COD') {
+      // Driver collects Total Amount in Cash.
+      // Driver owes the platform (Total Amount - Driver Earnings).
+      // So we subtract that from their balance.
+      const amountToSubtract = order.total_amount - driverEarnings;
+      await db.pool.query('UPDATE drivers SET wallet_balance = wallet_balance - $1 WHERE id = $2', [amountToSubtract, order.driver_id]);
+      console.log(`[COD] Driver ${order.driver_id} collected ₹${order.total_amount}. Subtracted ₹${amountToSubtract} from wallet.`);
+    } else {
+      // Online payment: Driver is credited their earnings
+      await db.pool.query('UPDATE drivers SET wallet_balance = wallet_balance + $1 WHERE id = $2', [driverEarnings, order.driver_id]);
+      console.log(`[ONLINE] Driver ${order.driver_id} credited ₹${driverEarnings}.`);
+    }
 
     // 3. Credit Restaurant Wallet
     await db.pool.query('UPDATE restaurants SET wallet_balance = wallet_balance + $1 WHERE id = $2', [restaurantEarnings, order.restaurant_id]);
@@ -740,7 +752,6 @@ app.post('/api/driver/complete-delivery', async (req, res) => {
       const userRes = await db.pool.query('SELECT referred_by FROM users WHERE id = $1', [order.user_id]);
       const referrerId = userRes.rows[0]?.referred_by;
       if (referrerId) {
-        // Credit referrer with 100 "Veg Coins"
         await db.pool.query('UPDATE users SET wallet_balance = wallet_balance + 100 WHERE id = $1', [referrerId]);
         console.log(`[REFERRAL] Credited 100 to user ${referrerId} for referring user ${order.user_id}`);
       }
@@ -1216,7 +1227,7 @@ app.post('/api/auth/phone-login', async (req, res) => {
     if (!phone) return res.status(400).json({ error: 'Phone number required' });
 
     // Clean phone number (strip +91 and spaces)
-    const cleanPhone = phone.replace('+91', '').replace(/\s/g, '').trim();
+    const cleanPhone = phone.toString().replace('+91', '').replace(/\s/g, '').trim();
 
     // Check if user exists
     let result = await db.pool.query('SELECT * FROM users WHERE phone = $1', [cleanPhone]);
@@ -1292,11 +1303,11 @@ app.post('/api/vendor/login', async (req, res) => {
 
     let result;
     if (login_id) {
-      // Login via login_id (string username)
-      result = await db.pool.query('SELECT * FROM restaurants WHERE login_id = $1', [login_id.trim()]);
-    } else {
-      // Login via numeric restaurant_id (legacy)
-      result = await db.pool.query('SELECT * FROM restaurants WHERE id = $1', [parseInt(restaurant_id)]);
+      // Login via login_id (string username) - Case Insensitive
+      result = await db.pool.query('SELECT * FROM restaurants WHERE LOWER(login_id) = LOWER($1)', [login_id.trim()]);
+    } else if (restaurant_id) {
+      // Login via numeric restaurant_id (legacy) OR numeric login_id
+      result = await db.pool.query('SELECT * FROM restaurants WHERE id = $1 OR LOWER(login_id) = LOWER($2)', [parseInt(restaurant_id), restaurant_id.toString().trim()]);
     }
     
     if (result.rows.length === 0) {
@@ -1665,8 +1676,9 @@ app.get('/api/vendor/:restaurant_id/orders', async (req, res) => {
     
     // Fetch all orders for this restaurant
     const ordersResult = await db.pool.query(
-      `SELECT o.*
+      `SELECT o.*, u.name as user_name, u.phone as user_phone
        FROM orders o 
+       JOIN users u ON o.user_id = u.id
        WHERE o.restaurant_id = $1 
        ORDER BY o.created_at DESC`,
       [restaurant_id]
