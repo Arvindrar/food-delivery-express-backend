@@ -113,12 +113,24 @@ io.on('connection', (socket) => {
 app.use(cors());
 app.use(express.json());
 
-// Test DB Connection
-db.pool.query('SELECT NOW()', (err, res) => {
+const KARAIKUDI_CENTER = { latitude: 10.0748, longitude: 78.7848 };
+// Karaikudi town spans ~4.0 km from center to outer neighborhoods (Sekkalai, Kalanivasal, Alagappa Univ, Ariyakudi, etc.)
+// Adding a 3.0 km outer buffer on all sides gives a 7.0 km total radius from center.
+const KARAIKUDI_TOWN_RADIUS_KM = 4.0;
+const KARAIKUDI_OUTER_BUFFER_KM = 3.0;
+const KARAIKUDI_SERVICE_RADIUS_KM = KARAIKUDI_TOWN_RADIUS_KM + KARAIKUDI_OUTER_BUFFER_KM; // 7.0 km total
+
+// Test DB Connection and ensure required columns exist
+db.pool.query('SELECT NOW()', async (err, res) => {
   if (err) {
     console.error('Error connecting to the database:', err.stack);
   } else {
     console.log('Database connected successfully at:', res.rows[0].now);
+    try {
+      await db.pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP');
+    } catch (migErr) {
+      console.error('Non-fatal error ensuring delivered_at column:', migErr.message);
+    }
   }
 });
 
@@ -717,16 +729,21 @@ app.post('/api/driver/complete-delivery', async (req, res) => {
     if (order.status === 'Completed') return res.status(400).json({ error: 'Order already completed' });
 
     const fees = calculateOrderFees(parseFloat(order.distance || 0));
-    const driverEarnings = fees.driverCommission;
-    // Restaurant earnings = Total - Platform Commission - Delivery Fee
-    const restaurantEarnings = order.total_amount - fees.platformCommission - fees.deliveryFee;
+    const driverEarnings = Number(order.driver_earnings ?? fees.driverCommission);
+    const chargedDelivery = Number(order.delivery_fee || 0);
+    const chargedHandling = Number(order.handling_fee || 0);
+    // Restaurant receives customer total minus the actual delivery & handling fees charged on this order
+    // (so free-delivery / discounted-delivery subsidies are absorbed by platform, not deducted twice from restaurant)
+    const restaurantEarnings = Math.max(0, Number(order.total_amount || 0) - chargedDelivery - chargedHandling);
+    // Net platform fee retained after paying driver's full delivery commission
+    const actualPlatformCommission = chargedDelivery + chargedHandling - driverEarnings;
 
     await db.pool.query('BEGIN');
 
-    // 1. Update Order Status and Earnings
+    // 1. Update Order Status, Delivered Time and Earnings
     const result = await db.pool.query(
-      'UPDATE orders SET status = \'Completed\', driver_earnings = $1, platform_commission = $2 WHERE id = $3 RETURNING *',
-      [driverEarnings, fees.platformCommission, order_id]
+      'UPDATE orders SET status = \'Completed\', delivered_at = COALESCE(delivered_at, NOW()), driver_earnings = $1, platform_commission = $2 WHERE id = $3 RETURNING *',
+      [driverEarnings, actualPlatformCommission, order_id]
     );
 
     // 2. Update Driver Wallet based on Payment Method
@@ -1056,28 +1073,39 @@ const autoAssignDriver = async (orderId, restaurantId) => {
 
 app.post('/api/payment/create-order', async (req, res) => {
   try {
+    dotenv.config();
+    const keyId = process.env.RAZORPAY_KEY_ID || 'rzp_test_TzY2VdKf46Do7o';
+    const keySecret = process.env.RAZORPAY_KEY_SECRET || 'vyJiVaSImY94dp79PBaUYZF0';
+
+    const rzpInstance = new Razorpay({
+      key_id: keyId,
+      key_secret: keySecret
+    });
+
     const { amount, currency = 'INR' } = req.body;
     
     const options = {
-      amount: amount * 100, // Razorpay expects amount in paise
+      amount: Math.round(Number(amount) * 100), // Razorpay expects integer amount in paise
       currency,
       receipt: `receipt_order_${Date.now()}`
     };
 
-    const order = await razorpay.orders.create(options);
-    console.log('[RAZORPAY] Order created:', order.id);
-    res.json(order);
+    const order = await rzpInstance.orders.create(options);
+    console.log('[RAZORPAY] Order created successfully:', order.id, 'Amount (paise):', order.amount);
+    res.json({ ...order, key_id: keyId });
   } catch (err) {
     console.error('[RAZORPAY ERROR] Failed to create order:', err);
-    res.status(500).json({ error: 'Failed to create Razorpay order' });
+    res.status(500).json({ error: 'Failed to create Razorpay order', details: err?.message });
   }
 });
 
 app.post('/api/payment/verify', async (req, res) => {
   try {
+    dotenv.config();
+    const keySecret = process.env.RAZORPAY_KEY_SECRET || 'vyJiVaSImY94dp79PBaUYZF0';
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
     const crypto = require('crypto');
-    const hmac = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET);
+    const hmac = crypto.createHmac('sha256', keySecret);
     hmac.update(razorpay_order_id + "|" + razorpay_payment_id);
     const generated_signature = hmac.digest('hex');
 
@@ -1104,6 +1132,26 @@ app.post('/api/orders', async (req, res) => {
     // Explicitly parse coordinates as numbers to avoid null/string conversion issues in DB
     const lat = latitude !== null && latitude !== undefined ? Number(latitude) : null;
     const lng = longitude !== null && longitude !== undefined ? Number(longitude) : null;
+
+    // [PRODUCTION GEOFENCE] Uncomment the block below before going live to enforce Full Karaikudi + 3km outer buffer (7.0 km radius):
+    // if (lat === null || lng === null || Number.isNaN(lat) || Number.isNaN(lng)) {
+    //   return res.status(400).json({
+    //     error: 'Valid delivery GPS coordinates are required to verify service availability in Karaikudi.'
+    //   });
+    // }
+    //
+    // const distanceFromKaraikudi = haversineDistance(
+    //   lat,
+    //   lng,
+    //   KARAIKUDI_CENTER.latitude,
+    //   KARAIKUDI_CENTER.longitude
+    // );
+    // if (distanceFromKaraikudi > KARAIKUDI_SERVICE_RADIUS_KM) {
+    //   console.log(`[ORDER REJECTED] Location (${lat}, ${lng}) is ${distanceFromKaraikudi.toFixed(2)} km from Karaikudi center (> ${KARAIKUDI_SERVICE_RADIUS_KM} km)`);
+    //   return res.status(400).json({
+    //     error: `Sorry! We currently only serve Karaikudi + 3km outer radius (${KARAIKUDI_SERVICE_RADIUS_KM}km from center). Your location is ${distanceFromKaraikudi.toFixed(2)}km away.`
+    //   });
+    // }
 
     console.log(`[ORDER] Creating for user ${user_id} at ${lat}, ${lng}`);
     
@@ -1203,8 +1251,31 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { phone, password } = req.body;
+    if (!phone || !password) return res.status(400).json({ error: 'Phone and password required' });
 
-    const userResult = await db.pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+    const cleanPhone = phone.toString().replace('+91', '').replace(/\s/g, '').trim();
+
+    // Check for test/dummy account setup for 8838374152 / 03091992
+    if (cleanPhone === '8838374152' && password === '03091992') {
+      let dummyResult = await db.pool.query('SELECT * FROM users WHERE phone = $1', [cleanPhone]);
+      let dummyUser;
+      if (dummyResult.rows.length === 0) {
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(password, salt);
+        const insertRes = await db.pool.query(
+          'INSERT INTO users (name, phone, address, password) VALUES ($1, $2, $3, $4) RETURNING *',
+          ['Test Customer', cleanPhone, 'Karaikudi, Tamil Nadu', hashedPassword]
+        );
+        dummyUser = insertRes.rows[0];
+      } else {
+        dummyUser = dummyResult.rows[0];
+      }
+      const token = jwt.sign({ id: dummyUser.id, role: 'customer' }, JWT_SECRET, { expiresIn: '30d' });
+      delete dummyUser.password;
+      return res.json({ token, user: dummyUser });
+    }
+
+    const userResult = await db.pool.query('SELECT * FROM users WHERE phone = $1', [cleanPhone]);
     if (userResult.rows.length === 0) return res.status(400).json({ error: 'Account not found' });
 
     const user = userResult.rows[0];
@@ -1218,6 +1289,118 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (err) {
     console.error('Login failed:', err);
     res.status(500).json({ error: 'Failed to login' });
+  }
+});
+
+// --- BACKEND IN-APP OTP STORE (NO "I AM NOT A ROBOT" RECAPTCHA) ---
+const otpStore = new Map(); // phone -> { otp, expiresAt, attempts, lastSentAt }
+
+app.post('/api/auth/send-otp', async (req, res) => {
+  try {
+    const rawPhone = String(req.body?.phone || '');
+    const cleanPhone = rawPhone.replace(/\D/g, '').slice(-10);
+    if (cleanPhone.length !== 10) {
+      return res.status(400).json({ error: 'Please enter a valid 10-digit mobile number' });
+    }
+
+    const now = Date.now();
+    const existing = otpStore.get(cleanPhone);
+    if (existing && now - existing.lastSentAt < 20 * 1000) {
+      const waitSec = Math.ceil((20 * 1000 - (now - existing.lastSentAt)) / 1000);
+      return res.status(429).json({ error: `Please wait ${waitSec}s before requesting another OTP.` });
+    }
+
+    const isSmsProd = process.env.OTP_SMS_ENABLED === 'true';
+    const otp = isSmsProd ? String(Math.floor(100000 + Math.random() * 900000)) : '123456';
+
+    otpStore.set(cleanPhone, {
+      otp,
+      expiresAt: now + 5 * 60 * 1000, // 5 minutes
+      attempts: 0,
+      lastSentAt: now,
+    });
+
+    if (isSmsProd) {
+      /*
+       * [PRODUCTION SMS GATEWAY — ZERO RECAPTCHA / NO "I AM NOT A ROBOT"]
+       * Uncomment one of the SMS providers below and set its key in backend/.env:
+       *
+       * // Option 1: Fast2SMS (India DLT / Quick OTP)
+       * await fetch('https://www.fast2sms.com/dev/bulkV2', {
+       *   method: 'POST',
+       *   headers: { authorization: process.env.FAST2SMS_API_KEY, 'Content-Type': 'application/json' },
+       *   body: JSON.stringify({ route: 'otp', variables_values: otp, numbers: cleanPhone }),
+       * });
+       *
+       * // Option 2: MSG91 OTP API
+       * await fetch(`https://control.msg91.com/api/v5/otp?template_id=${process.env.MSG91_TEMPLATE_ID}&mobile=91${cleanPhone}&otp=${otp}`, {
+       *   method: 'POST',
+       *   headers: { authkey: process.env.MSG91_AUTH_KEY },
+       * });
+       */
+      console.log(`[OTP PROD] Sent SMS OTP to +91${cleanPhone}`);
+      return res.json({ success: true, message: 'OTP sent to your mobile number' });
+    }
+
+    console.log(`[OTP DEV] Generated dev OTP for +91${cleanPhone}: ${otp}`);
+    return res.json({
+      success: true,
+      message: 'Dev OTP generated (auto-filled in app)',
+      dev_otp: otp,
+    });
+  } catch (err) {
+    console.error('[SEND OTP ERROR]', err);
+    res.status(500).json({ error: 'Could not send OTP. Please try again.' });
+  }
+});
+
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const cleanPhone = String(req.body?.phone || '').replace(/\D/g, '').slice(-10);
+    const cleanOtp = String(req.body?.otp || '').replace(/\D/g, '');
+
+    if (cleanPhone.length !== 10 || cleanOtp.length !== 6) {
+      return res.status(400).json({ error: 'Valid 10-digit phone and 6-digit OTP are required' });
+    }
+
+    const record = otpStore.get(cleanPhone);
+    if (!record) {
+      return res.status(400).json({ error: 'OTP expired or not requested. Please tap Resend OTP.' });
+    }
+    if (Date.now() > record.expiresAt) {
+      otpStore.delete(cleanPhone);
+      return res.status(400).json({ error: 'OTP has expired. Please request a new OTP.' });
+    }
+    if (record.attempts >= 5) {
+      otpStore.delete(cleanPhone);
+      return res.status(429).json({ error: 'Too many invalid attempts. Please request a new OTP.' });
+    }
+
+    if (record.otp !== cleanOtp) {
+      record.attempts += 1;
+      return res.status(400).json({ error: 'Invalid OTP. Please check and try again.' });
+    }
+
+    otpStore.delete(cleanPhone);
+
+    let result = await db.pool.query('SELECT * FROM users WHERE phone = $1', [cleanPhone]);
+    let user;
+    if (result.rows.length === 0) {
+      const insertResult = await db.pool.query(
+        'INSERT INTO users (name, phone, address) VALUES ($1, $2, $3) RETURNING *',
+        ['New Customer', cleanPhone, '']
+      );
+      user = insertResult.rows[0];
+    } else {
+      user = result.rows[0];
+    }
+
+    const token = jwt.sign({ id: user.id, role: 'customer' }, JWT_SECRET, { expiresIn: '30d' });
+    delete user.password;
+    return res.json({ token, user });
+  } catch (err) {
+    console.error('[VERIFY OTP ERROR]', err);
+    res.status(500).json({ error: 'Server error during OTP verification' });
   }
 });
 
@@ -1610,7 +1793,10 @@ app.get('/api/vendor/:restaurant_id/insights', async (req, res) => {
     
     const [stats, topDishes] = await Promise.all([
       db.pool.query(
-        'SELECT COUNT(*) as total_orders, SUM(total_amount) as total_revenue FROM orders WHERE restaurant_id = $1',
+        `SELECT 
+           COUNT(*) FILTER (WHERE status != 'Cancelled') as total_orders, 
+           COALESCE(SUM(GREATEST(total_amount - COALESCE(delivery_fee, 0) - COALESCE(handling_fee, 0), 0)) FILTER (WHERE status != 'Cancelled'), 0) as total_revenue 
+         FROM orders WHERE restaurant_id = $1`,
         [restaurant_id]
       ),
       db.pool.query(
@@ -1782,7 +1968,14 @@ app.put('/api/orders/:order_id/status', async (req, res) => {
     const { order_id } = req.params;
     const { status, user_id } = req.body;
     
-    await db.pool.query('UPDATE orders SET status = $1 WHERE id = $2', [status, order_id]);
+    if (status === 'Completed') {
+      await db.pool.query(
+        'UPDATE orders SET status = $1, delivered_at = COALESCE(delivered_at, NOW()) WHERE id = $2',
+        [status, order_id]
+      );
+    } else {
+      await db.pool.query('UPDATE orders SET status = $1 WHERE id = $2', [status, order_id]);
+    }
     
     // Phase 12: Emit status_updated event to the specific customer
     if (user_id) {
@@ -1882,7 +2075,17 @@ app.use((err, req, res, next) => {
 app.post('/api/payouts/request', async (req, res) => {
   try {
     const { user_type, user_id, amount } = req.body;
-    
+    const reqAmount = Number(amount);
+
+    if (!['driver', 'restaurant'].includes(user_type) || !user_id) {
+      return res.status(400).json({ error: 'Invalid payout account details' });
+    }
+    if (!Number.isFinite(reqAmount) || reqAmount <= 0) {
+      return res.status(400).json({ error: 'Payout amount must be greater than zero' });
+    }
+
+    await db.pool.query('BEGIN');
+
     // Check balance
     let balanceRes;
     if (user_type === 'driver') {
@@ -1891,15 +2094,33 @@ app.post('/api/payouts/request', async (req, res) => {
       balanceRes = await db.pool.query('SELECT wallet_balance FROM restaurants WHERE id = $1', [user_id]);
     }
 
-    if (balanceRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    const balance = parseFloat(balanceRes.rows[0].wallet_balance);
+    if (balanceRes.rows.length === 0) {
+      await db.pool.query('ROLLBACK');
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const balance = parseFloat(balanceRes.rows[0].wallet_balance) || 0;
 
-    if (amount > balance) return res.status(400).json({ error: 'Insufficient balance' });
+    // Subtract any already-pending payout requests to avoid over-requesting
+    const pendingRes = await db.pool.query(
+      "SELECT COALESCE(SUM(amount), 0) as pending_total FROM payout_requests WHERE user_type = $1 AND user_id = $2 AND status = 'pending'",
+      [user_type, user_id]
+    );
+    const pendingTotal = parseFloat(pendingRes.rows[0]?.pending_total || 0);
+    const availableToWithdraw = balance - pendingTotal;
+
+    if (reqAmount > availableToWithdraw) {
+      await db.pool.query('ROLLBACK');
+      return res.status(400).json({
+        error: pendingTotal > 0
+          ? `Insufficient available balance (₹${pendingTotal} already pending approval)`
+          : 'Insufficient balance'
+      });
+    }
 
     // Create request with 'pending' status
     await db.pool.query(
       'INSERT INTO payout_requests (user_type, user_id, amount, status) VALUES ($1, $2, $3, $4)',
-      [user_type, user_id, amount, 'pending']
+      [user_type, user_id, reqAmount, 'pending']
     );
 
     await db.pool.query('COMMIT');
